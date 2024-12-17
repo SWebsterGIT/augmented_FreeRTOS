@@ -198,6 +198,16 @@ extern "C"
  */
 #define tskIDLE_PRIORITY ((UBaseType_t)0U)
 
+/*
+Defines the priorities used by the EDF policy scheduler for EDF tasks
+Priorities below INACTIVE_PRIORITY can be used and will function as normal
+*/
+#if (configUSE_EDF_SCHEDULING == 1)
+ #define EDF_INACTIVE_PRIORITY (tskIDLE_PRIORITY + 4)
+ #define EDF_ACTIVE_PRIORITY (tskIDLE_PRIORITY + 5)
+#endif 
+
+
 /**
  * Defines affinity to all available cores.
  *
@@ -389,6 +399,24 @@ extern "C"
                            UBaseType_t uxPriority,
                            TaskHandle_t *const pxCreatedTask) PRIVILEGED_FUNCTION;
 #endif
+
+#if configUSE_EDF_SCHEDULING
+BaseType_t xEDFTaskCreate(TaskFunction_t pxTaskCode,
+                          const char *const pcName,
+                          const configSTACK_DEPTH_TYPE uxStackDepth,
+                          void *const pvParameters,
+                          TickType_t relative_deadline, // Deadline resolution is based on tick rate (same as period resolution)
+                          TaskHandle_t *const pxCreatedTask);
+#endif // configUSE_EDF_SCHEDULING
+
+#ifdef CBS_SERVER
+void init_CBS_server(TaskHandle_t pxCreatedCBS_handle, TickType_t period, TickType_t maxbudget);
+#endif 
+
+#if configUSE_EDF_SCHEDULING
+BaseType_t xEDFTaskDelayPeriodic(TickType_t *const pxPreviousWakeTime,
+                                 const TickType_t xTimeIncrement);
+#endif // configUSE_EDF_SCHEDULING
 
 #if ((configSUPPORT_DYNAMIC_ALLOCATION == 1) && (configNUMBER_OF_CORES > 1) && (configUSE_CORE_AFFINITY == 1))
     BaseType_t xTaskCreateAffinitySet(TaskFunction_t pxTaskCode,

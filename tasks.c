@@ -359,6 +359,18 @@
 #endif /* #if ( configNUMBER_OF_CORES > 1 ) */
 /*-----------------------------------------------------------*/
 
+#ifdef CBS_SERVER
+#include "queue.h"
+
+
+typedef struct 
+{
+    TickType_t period;
+    TickType_t maximum_budget;
+    TickType_t current_budget;
+} CBS_server_instance_t;
+#endif 
+
 /*
  * Task control block.  A task control block (TCB) is allocated for each task,
  * and stores task state information, including a pointer to the task's context
@@ -442,6 +454,17 @@ typedef struct tskTaskControlBlock /* The old naming convention is used to preve
 #if (configUSE_POSIX_ERRNO == 1)
     int iTaskErrno;
 #endif
+
+#if (configUSE_EDF_SCHEDULING == 1)
+    bool is_EDF_task;
+    TickType_t relative_deadline;
+    ListItem_t xDeadlineListItem; /**< Used to reference a task from a deadline list. */
+#endif
+
+#ifdef CBS_SERVER
+    bool is_CBS_server;
+    CBS_server_instance_t CBS_server_instance;
+#endif
 } tskTCB;
 
 /* The old tskTCB name is maintained above then typedefed to the new TCB_t name
@@ -471,6 +494,11 @@ PRIVILEGED_DATA static List_t xDelayedTaskList2;                       /**< Dela
 PRIVILEGED_DATA static List_t *volatile pxDelayedTaskList;             /**< Points to the delayed task list currently being used. */
 PRIVILEGED_DATA static List_t *volatile pxOverflowDelayedTaskList;     /**< Points to the delayed task list currently being used to hold tasks that have overflowed the current tick count. */
 PRIVILEGED_DATA static List_t xPendingReadyList;                       /**< Tasks that have been readied while the scheduler was suspended.  They will be moved to the ready list when the scheduler is resumed. */
+
+#if (configUSE_EDF_SCHEDULING == 1)
+// EDF deadline list
+PRIVILEGED_DATA static List_t xDeadlineList; /**< List to store absolute deadlines for ready tasks.*/
+#endif
 
 #if (INCLUDE_vTaskDelete == 1)
 
@@ -502,6 +530,162 @@ PRIVILEGED_DATA static volatile BaseType_t xNumOfOverflows = (BaseType_t)0;
 PRIVILEGED_DATA static UBaseType_t uxTaskNumber = (UBaseType_t)0U;
 PRIVILEGED_DATA static volatile TickType_t xNextTaskUnblockTime = (TickType_t)0U; /* Initialised to portMAX_DELAY before the scheduler starts. */
 PRIVILEGED_DATA static TaskHandle_t xIdleTaskHandles[configNUMBER_OF_CORES];      /**< Holds the handles of the idle tasks.  The idle tasks are created automatically when the scheduler is started. */
+
+#ifdef OPTIMIZED_TIMESLICING
+PRIVILEGED_DATA static volatile uint8_t num_tasks_running_with_priority[configMAX_PRIORITIES];
+#endif // OPTIMIZED_TIMESLICING
+
+#ifdef CBS_SERVER
+
+void remove_edf_task_from_pool(TCB_t* tcb_to_remove_ptr)
+{
+    uxListRemove(&(tcb_to_remove_ptr->xDeadlineListItem));
+    uxListRemove(&(tcb_to_remove_ptr->xStateListItem)); 
+
+    tcb_to_remove_ptr->uxPriority = EDF_INACTIVE_PRIORITY; 
+
+    prvAddTaskToReadyList(tcb_to_remove_ptr); // we re-add the task to the delay list to make this function more general
+    
+    if (pdTRUE == listLIST_IS_EMPTY(&xDeadlineList)) { return; } // No work to do if no other pending EDF tasks
+
+    TCB_t* p_EDF_task_to_promote = NULL;
+
+#if configNUMBER_OF_CORES == 1
+    p_EDF_task_to_promote = (TCB_t *)listGET_OWNER_OF_HEAD_ENTRY(&xDeadlineList);
+#else // configNUMBER_OF_CORES == 1
+
+    // If there are less items in the deadline list than available cores, then its possible everything will already be running and no promotions are needed 
+    // But we need to do it this way to cover the case of core affinity pins causing a task to have not been scheduled despite less tasks ready than total number of cores
+    const ListItem_t *pxEndMarker = listGET_END_MARKER(&xDeadlineList);
+
+    // Go through the deadline list until we find a task that isnt running on a core currently
+    for (ListItem_t* pxIterator = listGET_HEAD_ENTRY(&xDeadlineList); pxIterator != pxEndMarker; pxIterator = listGET_NEXT(pxIterator))
+    {   
+        TCB_t* potential_task_to_promote_ptr = listGET_LIST_ITEM_OWNER(pxIterator);
+
+        // if the task isn't currently running then promote it
+        if ((potential_task_to_promote_ptr->xTaskRunState == taskTASK_NOT_RUNNING) 
+            && (potential_task_to_promote_ptr->uxPriority == EDF_INACTIVE_PRIORITY)) // Need this to account for if TMR task is taking up a running slot pushing an active EDF task out of running state
+        {
+            p_EDF_task_to_promote = potential_task_to_promote_ptr;
+            break; // break since we can only promote one new task
+        }
+
+    }
+
+    if (p_EDF_task_to_promote == NULL) { return; } // No promotable task found, no more work to do
+
+#endif //configNUMBER_OF_CORES == 1
+
+    uxListRemove(&(p_EDF_task_to_promote->xStateListItem));
+
+    p_EDF_task_to_promote->uxPriority = EDF_ACTIVE_PRIORITY;  
+
+    prvAddTaskToReadyList(p_EDF_task_to_promote);
+
+}
+
+
+/*
+Task to add should already have its absolute deadline set
+*/
+void add_edf_task_to_pool(TCB_t* tcb_to_add_ptr)
+{
+    TickType_t abs_deadline = listGET_LIST_ITEM_VALUE(&(tcb_to_add_ptr->xDeadlineListItem));
+
+    TCB_t *p_task_to_downgrade = NULL;
+#if configNUMBER_OF_CORES == 1
+
+    if (listCURRENT_LIST_LENGTH(&xDeadlineList) < configNUMBER_OF_CORES)
+    {
+        // make this newly created task have priority HI - its the only task
+        tcb_to_add_ptr->uxPriority = EDF_ACTIVE_PRIORITY; 
+    }
+    else
+    {
+        static volatile TCB_t* potential_task_to_downgrade_ptr;
+        potential_task_to_downgrade_ptr = (TCB_t *)listGET_OWNER_OF_HEAD_ENTRY(&xDeadlineList); // static and volatile for debugging only for now
+        TickType_t at_risk_deadline = listGET_LIST_ITEM_VALUE(&(potential_task_to_downgrade_ptr->xDeadlineListItem));
+
+        if (abs_deadline < at_risk_deadline)
+        {
+            p_task_to_downgrade = (TCB_t *) potential_task_to_downgrade_ptr;
+        }
+        
+    }
+
+#else // configNUMBER_OF_CORES == 1
+
+    // If the deadline list has less or equal elements than the number of cores, 
+    // we know at least one core was not in use and we can simply count on running our new task on that core
+    if (listCURRENT_LIST_LENGTH(&xDeadlineList) < configNUMBER_OF_CORES)
+    {
+        // Make this newly created task have priority HI
+        tcb_to_add_ptr->uxPriority = EDF_ACTIVE_PRIORITY; 
+    }
+    else
+    { 
+        // Check the numcore'th element in the deadline list to see if any are later than ours
+        ListItem_t *pxIterator = listGET_HEAD_ENTRY(&xDeadlineList);
+        uint8_t num_checked = 1;
+
+        while (num_checked < configNUMBER_OF_CORES) // List gaurenteed to have at least numcores entries if we hit this else block
+        {
+            pxIterator = listGET_NEXT(pxIterator);
+            num_checked += 1;
+        }
+
+        TCB_t* potential_task_to_downgrade_ptr = listGET_LIST_ITEM_OWNER(pxIterator);
+        TickType_t at_risk_deadline = listGET_LIST_ITEM_VALUE(&(potential_task_to_downgrade_ptr->xDeadlineListItem));
+
+        if (abs_deadline < at_risk_deadline)
+        {
+            p_task_to_downgrade = potential_task_to_downgrade_ptr;
+        }
+        
+    }
+
+#endif // configNUMBER_OF_CORES == 1
+    
+    if (p_task_to_downgrade != NULL)
+    {
+        uxListRemove(&(p_task_to_downgrade->xStateListItem));
+
+        p_task_to_downgrade->uxPriority = EDF_INACTIVE_PRIORITY;
+
+        prvAddTaskToReadyList(p_task_to_downgrade);
+
+        tcb_to_add_ptr->uxPriority = EDF_ACTIVE_PRIORITY;
+    }
+
+    vListInsert(&xDeadlineList, &(tcb_to_add_ptr->xDeadlineListItem));
+
+}
+
+
+void arbitrate_edf_task_priorities(TCB_t* altered_deadline_tcb_ptr)
+{
+    remove_edf_task_from_pool(altered_deadline_tcb_ptr);
+    add_edf_task_to_pool(altered_deadline_tcb_ptr);
+}
+
+
+
+void init_CBS_server(TaskHandle_t pxCreatedCBS_handle, TickType_t period, TickType_t maxbudget)
+{  
+    TCB_t* pxCreatedCBS_ptr = (TCB_t*) pxCreatedCBS_handle;
+    
+    pxCreatedCBS_ptr->is_CBS_server = true;
+    pxCreatedCBS_ptr->CBS_server_instance.period = period;
+    pxCreatedCBS_ptr->CBS_server_instance.maximum_budget = maxbudget;
+    pxCreatedCBS_ptr->CBS_server_instance.current_budget = maxbudget;
+
+    return;
+}
+
+
+#endif //CBS_SERVER
+
 
 /* Improve support for OpenOCD. The kernel tracks Ready tasks via priority lists.
  * For tracking the state of remote threads, OpenOCD uses uxTopUsedPriority
@@ -1624,8 +1808,9 @@ BaseType_t xTaskCreateRestrictedAffinitySet(const TaskParameters_t *const pxTask
 #endif /* #if ( ( configNUMBER_OF_CORES > 1 ) && ( configUSE_CORE_AFFINITY == 1 ) ) */
 
 #endif /* portUSING_MPU_WRAPPERS */
-/*-----------------------------------------------------------*/
 
+
+/*-----------------------------------------------------------*/
 #if (configSUPPORT_DYNAMIC_ALLOCATION == 1)
 static TCB_t *prvCreateTask(TaskFunction_t pxTaskCode,
                             const char *const pcName,
@@ -1739,6 +1924,14 @@ BaseType_t xTaskCreate(TaskFunction_t pxTaskCode,
 
     pxNewTCB = prvCreateTask(pxTaskCode, pcName, uxStackDepth, pvParameters, uxPriority, pxCreatedTask);
 
+#if (configUSE_EDF_SCHEDULING == 1)
+    pxNewTCB->is_EDF_task = false;
+#endif // (configUSE_EDF_SCHEDULING == 1)
+
+#ifdef CBS_SERVER
+    pxNewTCB->is_CBS_server = false;
+#endif
+
     if (pxNewTCB != NULL)
     {
 #if ((configNUMBER_OF_CORES > 1) && (configUSE_CORE_AFFINITY == 1))
@@ -1760,6 +1953,78 @@ BaseType_t xTaskCreate(TaskFunction_t pxTaskCode,
 
     return xReturn;
 }
+
+#if (configUSE_EDF_SCHEDULING == 1)
+
+#define EDF_INACTIVE_PRIORITY (tskIDLE_PRIORITY + 4)
+#define EDF_ACTIVE_PRIORITY (tskIDLE_PRIORITY + 5)
+
+BaseType_t xEDFTaskCreate(TaskFunction_t pxTaskCode,
+                          const char *const pcName,
+                          const configSTACK_DEPTH_TYPE uxStackDepth,
+                          void *const pvParameters,
+                          TickType_t relative_deadline, // Deadline resolution is based on tick rate (same as period resolution)
+                          TaskHandle_t *const pxCreatedTask)
+{
+    BaseType_t xReturn;
+
+    UBaseType_t uxPriority = EDF_INACTIVE_PRIORITY;
+
+    TaskHandle_t tempHandle; // Using to get over the case where user passes in NULL for pxCreatedTask
+
+    xReturn = xTaskCreate(pxTaskCode, pcName, uxStackDepth, pvParameters, uxPriority, &tempHandle);
+
+    TCB_t *pxNewTCB = (TCB_t *)tempHandle;
+
+    pxNewTCB->relative_deadline = relative_deadline;
+    pxNewTCB->is_EDF_task = true;
+
+    vListInitialiseItem(&(pxNewTCB->xDeadlineListItem));
+
+    listSET_LIST_ITEM_OWNER(&(pxNewTCB->xDeadlineListItem), pxNewTCB);
+
+    TickType_t abs_deadline = xTickCount + relative_deadline;
+
+    listSET_LIST_ITEM_VALUE(&(pxNewTCB->xDeadlineListItem), abs_deadline);
+
+    taskENTER_CRITICAL(); 
+    {
+        uxListRemove(&(pxNewTCB->xStateListItem));
+        add_edf_task_to_pool(pxNewTCB);
+        prvAddTaskToReadyList(pxNewTCB);
+    }
+    taskEXIT_CRITICAL();
+
+    if (pxCreatedTask != NULL)
+    {
+        *pxCreatedTask = tempHandle;
+    }
+
+    return xReturn;
+}
+#endif
+/*-----------------------------------------------------------*/
+#if (configUSE_EDF_SCHEDULING == 1)
+
+BaseType_t xEDFTaskDelayPeriodic(TickType_t *const pxPreviousWakeTime,
+                                 const TickType_t xTimeIncrement)
+{
+
+    // We do this in a critical section, since as soon as we demote the current task in priority, it is possible another task will get scheduled on a tick increment and list integrity will be lost
+    BaseType_t xReturn = pdTRUE;
+
+    taskENTER_CRITICAL(); 
+
+    remove_edf_task_from_pool(pxCurrentTCB);
+
+    taskEXIT_CRITICAL();
+
+    xReturn &= xTaskDelayUntil(pxPreviousWakeTime, xTimeIncrement); // Hoping that this being inside a critical section is ok.
+
+
+    return xReturn;
+}
+#endif
 /*-----------------------------------------------------------*/
 
 #if ((configNUMBER_OF_CORES > 1) && (configUSE_CORE_AFFINITY == 1))
@@ -3748,6 +4013,16 @@ void vTaskStartScheduler(void)
 
         traceTASK_SWITCHED_IN();
 
+#ifdef OPTIMIZED_TIMESLICING
+    for (BaseType_t xCoreID = (BaseType_t)0; xCoreID < (BaseType_t)configNUMBER_OF_CORES; xCoreID++)
+    {
+        num_tasks_running_with_priority[pxCurrentTCBs[xCoreID]->uxPriority] += 1;
+    }
+
+    //num_tasks_running_with_priority[tskIDLE_PRIORITY] += configNUMBER_OF_CORES;
+
+#endif // OPTIMIZED_TIMESLICING
+
         traceSTARTING_SCHEDULER(xIdleTaskHandles);
 
         /* Setting up the timer tick is hardware specific and thus in the
@@ -4708,7 +4983,7 @@ BaseType_t xTaskAbortDelay(TaskHandle_t xTask)
 #endif /* INCLUDE_xTaskAbortDelay */
 /*----------------------------------------------------------*/
 
-BaseType_t xTaskIncrementTick(void)
+BaseType_t xTaskIncrementTick(void) // This is called in a critical section by the systick handler (port dependant)
 {
     TCB_t *pxTCB;
     TickType_t xItemValue;
@@ -4743,6 +5018,89 @@ BaseType_t xTaskIncrementTick(void)
         {
             mtCOVERAGE_TEST_MARKER();
         }
+
+#ifdef CBS_SERVER
+
+#if (configNUMBER_OF_CORES == 1)
+
+    if (true == pxCurrentTCB->is_CBS_server)
+    {
+
+        CBS_server_instance_t* cbs_server_ptr = &pxCurrentTCB->CBS_server_instance;
+
+        cbs_server_ptr->current_budget -= 1;
+
+        // If server is out of budget, refresh the budget and push the deadline forward one period
+        if (cbs_server_ptr->current_budget == 0)
+        {
+
+            traceWRITE_CBS_LOG(cbs_server_ptr->current_budget);
+
+            cbs_server_ptr->current_budget = cbs_server_ptr->maximum_budget;
+
+            traceWRITE_CBS_LOG(cbs_server_ptr->current_budget);
+
+            TickType_t current_cbs_deadline = listGET_LIST_ITEM_VALUE(&(pxCurrentTCB->xDeadlineListItem));
+
+            TickType_t abs_deadline = current_cbs_deadline + cbs_server_ptr->period;
+
+            listSET_LIST_ITEM_VALUE(&(pxCurrentTCB->xDeadlineListItem), abs_deadline);
+
+            arbitrate_edf_task_priorities(pxCurrentTCB);
+
+            // press for a yeild
+            xYieldPendings[0] = pdTRUE;
+            
+        }
+
+        
+    }
+
+
+
+#else // (configNUMBER_OF_CORES == 1)
+    BaseType_t xCoreID;
+
+    for (xCoreID = 0; xCoreID < ((BaseType_t)configNUMBER_OF_CORES); xCoreID++)
+    {
+        if (false == pxCurrentTCBs[xCoreID]->is_CBS_server) {continue;}
+
+        // If we get here, we have a cbs server task instance
+
+        CBS_server_instance_t* cbs_server_ptr = &pxCurrentTCBs[xCoreID]->CBS_server_instance;
+
+        cbs_server_ptr->current_budget -= 1;
+
+        // If server is out of budget, refresh the budget and push the deadline forward one period
+        if (cbs_server_ptr->current_budget == 0)
+        {
+            traceWRITE_CBS_LOG_EXTERNAL_TASK(pxCurrentTCBs[xCoreID],cbs_server_ptr->current_budget);
+
+            cbs_server_ptr->current_budget = cbs_server_ptr->maximum_budget;
+
+            traceWRITE_CBS_LOG_EXTERNAL_TASK(pxCurrentTCBs[xCoreID],cbs_server_ptr->current_budget);
+
+            TickType_t current_cbs_deadline = listGET_LIST_ITEM_VALUE(&(pxCurrentTCBs[xCoreID]->xDeadlineListItem));
+
+            TickType_t abs_deadline = current_cbs_deadline + cbs_server_ptr->period;
+
+            listSET_LIST_ITEM_VALUE(&(pxCurrentTCBs[xCoreID]->xDeadlineListItem), abs_deadline);
+
+            arbitrate_edf_task_priorities(pxCurrentTCBs[xCoreID]);
+
+            // press for a yeild on all cores, since its possible for the arbitrate function to shuffle around tasks
+            for (BaseType_t i = 0; i < ((BaseType_t)configNUMBER_OF_CORES); i++) 
+            {
+                xYieldPendings[i] = pdTRUE;
+            } 
+            
+        }
+
+    }
+
+#endif // NUMCORES > 1
+#endif // CBS_SERVER
+
 
         /* See if this tick has made a timeout expire.  Tasks are stored in
          * the  queue in the order of their wake time - meaning once one task
@@ -4803,6 +5161,34 @@ BaseType_t xTaskIncrementTick(void)
                         mtCOVERAGE_TEST_MARKER();
                     }
 
+#if (configUSE_EDF_SCHEDULING == 1)
+
+                    if (pxTCB->is_EDF_task)
+                    {
+                        TickType_t abs_deadline = xTickCount + pxTCB->relative_deadline;
+
+                        listSET_LIST_ITEM_VALUE(&(pxTCB->xDeadlineListItem), abs_deadline);
+
+                        add_edf_task_to_pool(pxTCB);
+
+                    }
+
+                /*Based on the code below, this will trigger a context switch if the new task is 
+                an earlier deadline, without adding anything new.
+
+                This is because the piece of code just below here:
+
+                if (pxTCB->uxPriority > pxCurrentTCB->uxPriority)
+                        {
+                            xSwitchRequired = pdTRUE;
+                        }
+                will run for single core cases.
+
+                For multicore prvYieldForTask(pxTCB) will be run regardless of the priority, 
+                */
+
+#endif // #if (configUSE_EDF_SCHEDULING == 1)
+
                     /* Place the unblocked task into the appropriate ready
                      * list. */
                     prvAddTaskToReadyList(pxTCB);
@@ -4832,7 +5218,7 @@ BaseType_t xTaskIncrementTick(void)
                         }
 #else  /* #if( configNUMBER_OF_CORES == 1 ) */
                         {
-                            prvYieldForTask(pxTCB);
+                            prvYieldForTask(pxTCB); 
                         }
 #endif /* #if( configNUMBER_OF_CORES == 1 ) */
                     }
@@ -4863,7 +5249,14 @@ BaseType_t xTaskIncrementTick(void)
 
                 for (xCoreID = 0; xCoreID < ((BaseType_t)configNUMBER_OF_CORES); xCoreID++)
                 {
+
+                #ifdef OPTIMIZED_TIMESLICING
+                    if ( (listCURRENT_LIST_LENGTH(&(pxReadyTasksLists[pxCurrentTCBs[xCoreID]->uxPriority])) 
+                    > (num_tasks_running_with_priority[pxCurrentTCBs[xCoreID]->uxPriority])) 
+                    && !(pxCurrentTCBs[xCoreID]->uxTaskAttributes & taskATTRIBUTE_IS_IDLE) )
+                #else // ifdef OPTIMIZED_TIMESLICING
                     if (listCURRENT_LIST_LENGTH(&(pxReadyTasksLists[pxCurrentTCBs[xCoreID]->uxPriority])) > 1U)
+                #endif // ifdef OPTIMIZED_TIMESLICING
                     {
                         xYieldPendings[xCoreID] = pdTRUE;
                     }
@@ -5105,7 +5498,7 @@ void vTaskSwitchContext(void)
     else
     {
         xYieldPendings[0] = pdFALSE;
-        traceTASK_SWITCHED_OUT();
+        traceTASK_SWITCHED_OUT(); 
 
 #if (configGENERATE_RUN_TIME_STATS == 1)
         {
@@ -5207,6 +5600,14 @@ void vTaskSwitchContext(BaseType_t xCoreID)
         {
             xYieldPendings[xCoreID] = pdFALSE;
             traceTASK_SWITCHED_OUT();
+#ifdef OPTIMIZED_TIMESLICING
+            
+            if (pxCurrentTCBs[xCoreID]->uxPriority == EDF_INACTIVE_PRIORITY) 
+            { num_tasks_running_with_priority[EDF_ACTIVE_PRIORITY] -= 1; }
+            else 
+            { num_tasks_running_with_priority[pxCurrentTCBs[xCoreID]->uxPriority] -= 1; }
+            
+#endif // ifdef OPTIMIZED_TIMESLICING
 
 #if (configGENERATE_RUN_TIME_STATS == 1)
             {
@@ -5250,6 +5651,10 @@ void vTaskSwitchContext(BaseType_t xCoreID)
             taskSELECT_HIGHEST_PRIORITY_TASK(xCoreID);
             traceTASK_SWITCHED_IN();
 
+#ifdef OPTIMIZED_TIMESLICING
+    num_tasks_running_with_priority[pxCurrentTCBs[xCoreID]->uxPriority] += 1;
+#endif // OPTIMIZED_TIMESLICING
+
             /* Macro to inject port specific behaviour immediately after
              * switching tasks, such as setting an end of stack watchpoint
              * or reconfiguring the MPU. */
@@ -5285,6 +5690,16 @@ void vTaskPlaceOnEventList(List_t *const pxEventList,
     traceENTER_vTaskPlaceOnEventList(pxEventList, xTicksToWait);
 
     configASSERT(pxEventList);
+
+#ifdef CBS_SERVER
+    taskENTER_CRITICAL();
+
+    if (pxCurrentTCB->is_CBS_server) 
+    {
+        remove_edf_task_from_pool(pxCurrentTCB);
+    }
+    taskEXIT_CRITICAL();
+#endif //CBS_SERVER
 
     /* THIS FUNCTION MUST BE CALLED WITH THE
      * SCHEDULER SUSPENDED AND THE QUEUE BEING ACCESSED LOCKED. */
@@ -5402,6 +5817,39 @@ BaseType_t xTaskRemoveFromEventList(const List_t *const pxEventList)
     pxUnblockedTCB = listGET_OWNER_OF_HEAD_ENTRY(pxEventList);
     configASSERT(pxUnblockedTCB);
     listREMOVE_ITEM(&(pxUnblockedTCB->xEventListItem));
+
+
+#ifdef CBS_SERVER
+    // If we are unblocking a cbs server, then add to to the task pool with updated budget and deadline if needed
+    // This is called from within a critical section
+    if (pxUnblockedTCB->is_CBS_server)
+    {
+        // when a new job comes in, the server becomes active and the following check takes place:
+        // If remaining budget Cs(t) > (ds – t)Us , the deadline is advanced to t + Ps and budget replinished
+        TCB_t* cbs_TCB_ptr = pxUnblockedTCB;
+        CBS_server_instance_t* cbs_server_ptr = &cbs_TCB_ptr->CBS_server_instance;
+
+        TickType_t curr_deadline = listGET_LIST_ITEM_VALUE(&(cbs_TCB_ptr->xDeadlineListItem));
+
+        traceWRITE_CBS_LOG_EXTERNAL_TASK(cbs_TCB_ptr,cbs_server_ptr->current_budget);
+
+        if ((xTickCount > curr_deadline) 
+        || ((cbs_server_ptr->current_budget) > (((curr_deadline - xTickCount)* cbs_server_ptr->maximum_budget) /cbs_server_ptr->period)))
+        {
+            cbs_server_ptr->current_budget = cbs_server_ptr->maximum_budget; 
+
+            TickType_t abs_deadline = xTickCount + cbs_server_ptr->period;
+
+            listSET_LIST_ITEM_VALUE(&(cbs_TCB_ptr->xDeadlineListItem), abs_deadline);
+
+        }
+
+        add_edf_task_to_pool(cbs_TCB_ptr);
+
+    }
+        
+#endif // CBS_SERVER
+
 
     if (uxSchedulerSuspended == (UBaseType_t)0U)
     {
@@ -6073,6 +6521,12 @@ static void prvInitialiseTaskLists(void)
         vListInitialise(&xSuspendedTaskList);
     }
 #endif /* INCLUDE_vTaskSuspend */
+
+#if (configUSE_EDF_SCHEDULING == 1)
+    {
+        vListInitialise(&xDeadlineList);
+    }
+#endif /* configUSE_EDF_SCHEDULING */
 
     /* Start with pxDelayedTaskList using list1 and the pxOverflowDelayedTaskList
      * using list2. */
